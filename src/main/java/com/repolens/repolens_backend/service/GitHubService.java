@@ -11,9 +11,13 @@ import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
+
 import reactor.core.publisher.Mono;
 import reactor.util.retry.Retry;
 
+import org.springframework.web.util.UriComponentsBuilder;
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.time.Duration;
 import java.util.*;
 import java.util.Base64;
@@ -25,6 +29,10 @@ import java.util.stream.Collectors;
 @Slf4j
 @Service
 public class GitHubService {
+    @Value("${spring.security.oauth2.client.registration.github.client-id}")
+    private String clientId;
+    @Value("${spring.security.oauth2.client.registration.github.redirect-uri}")
+    private String redirectUri;
 
     private final WebClient githubWebClient;
     private final AtomicInteger rateLimitRemaining = new AtomicInteger(-1);
@@ -36,7 +44,7 @@ public class GitHubService {
     @Value("${github.api.max-files:20}")
     private int maxFiles;
 
-    @Value("${github.api.max-file-size:15000}")
+    @Value("${github.api.max-file-size:50000}")
     private int maxFileSize;
 
     public GitHubService(@Qualifier("githubWebClient") WebClient githubWebClient) {
@@ -58,12 +66,211 @@ public class GitHubService {
         if (matcher.find()) {
             String owner = matcher.group(1);
             String repo = matcher.group(2);
-            log.debug("✓ Parsed GitHub URL: {}/{}", owner, repo);
+            log.debug("Parsed GitHub URL: {}/{}", owner, repo);
             return new String[]{owner, repo};
         }
 
         throw new IllegalArgumentException("Invalid GitHub URL format. Expected: https://github.com/owner/repo");
     }
+
+    /**
+     * Check if we can access a repository
+     * Returns: "PUBLIC", "PRIVATE", or "INACCESSIBLE"
+     */
+    public String checkRepositoryAccessibility(String owner, String repo, String userToken) {
+        log.info("🔍 Checking repository accessibility: {}/{}", owner, repo);
+
+        try {
+            WebClient.RequestHeadersSpec<?> request = githubWebClient
+                    .get()
+                    .uri("/repos/{owner}/{repo}", owner, repo);
+
+            request = request.header("Accept", "application/vnd.github.mercy-preview+json");
+
+            // Use user's token if available
+            if (userToken != null && !userToken.isEmpty()) {
+                request = request.header("Authorization", "Bearer " + userToken);
+                log.info("🔐 Using user token");
+            } else if (isTokenValid()) {
+                request = request.header("Authorization", "Bearer " + githubToken);
+                log.info("🔓 Using app token");
+            }
+
+            GitHubRepository repository = request
+                    .retrieve()
+                    .bodyToMono(GitHubRepository.class)
+                    .timeout(Duration.ofSeconds(15))
+                    .retryWhen(Retry.backoff(2, Duration.ofSeconds(2)))
+                    .block();
+
+            if (repository == null) {
+                return "INACCESSIBLE";
+            }
+
+            return repository.isPrivate() ? "PRIVATE" : "PUBLIC";
+
+        } catch (WebClientResponseException.NotFound e) {
+            log.warn("⚠️ Not found or private");
+            return "INACCESSIBLE";
+        } catch (WebClientResponseException.Unauthorized | WebClientResponseException.Forbidden e) {
+            log.warn("⚠️ Private repo - auth required");
+            return "PRIVATE";
+        } catch (Exception e) {
+            log.error("❌ Error: {}", e.getMessage());
+            return "INACCESSIBLE";
+        }
+    }
+
+    /**
+     * Overload getRepository() to accept token
+     */
+    public GitHubRepository getRepository(String owner, String repo, String userToken) {
+        log.info("📦 Fetching repository metadata: {}/{}", owner, repo);
+
+        try {
+            WebClient.RequestHeadersSpec<?> request = githubWebClient
+                    .get()
+                    .uri("/repos/{owner}/{repo}", owner, repo);
+
+            request = request.header("Accept", "application/vnd.github.mercy-preview+json");  // ✅ Separate line //
+
+            // Use user token if available
+            if (userToken != null && !userToken.isEmpty()) {
+                request = request.header("Authorization", "Bearer " + userToken);
+                log.info("🔐 Using user token");
+            } else if (isTokenValid()) {
+                request = request.header("Authorization", "Bearer " + githubToken);
+            }
+
+            GitHubRepository repository = request
+                    .retrieve()
+                    .bodyToMono(GitHubRepository.class)
+                    .timeout(Duration.ofSeconds(15))
+                    .retryWhen(Retry.backoff(2, Duration.ofSeconds(2)))
+                    .block();
+
+            if (repository == null) {
+                throw new RuntimeException("Repository response was null");
+            }
+            if (repository.getTopics() == null) {
+                repository.setTopics(new ArrayList<>());
+            }
+
+            updateRateLimitStatus();
+            log.info("✓ Repository metadata fetched");
+            return repository;
+
+        } catch (WebClientResponseException.NotFound e) {
+            log.error("❌ Repository not found");
+            throw new RuntimeException("Repository not found", e);
+        } catch (WebClientResponseException e) {
+            log.error("❌ GitHub API error: {}", e.getStatusCode());
+            throw new RuntimeException("Failed to fetch repository", e);
+        } catch (Exception e) {
+            log.error("❌ Error: {}", e.getMessage());
+            throw new RuntimeException("Error fetching repository metadata", e);
+        }
+    }
+
+    /**
+     * Overload collectRepositoryCode() to accept token
+     */
+    public String collectRepositoryCode(String owner, String repo, String userToken) {
+        log.info("🔍 Collecting code for {}/{}", owner, repo);
+
+        StringBuilder codeBuilder = new StringBuilder();
+        List<GitHubContent> rootContents = getContents(owner, repo, "", userToken);
+
+        if (rootContents.isEmpty()) {
+            log.warn("⚠️ No contents found");
+            return "";
+        }
+
+        int fileCount = 0;
+        fileCount = collectPriorityFiles(owner, repo, rootContents, codeBuilder, fileCount, userToken);
+
+        String language = detectLanguageWithSubdirectories(owner, repo, rootContents, userToken);
+        log.info("📊 Language: {}", language);
+
+        if ("C#".equalsIgnoreCase(language)) {
+            fileCount = scanAllCSharpFolders(owner, repo, rootContents, codeBuilder, fileCount, userToken);
+        } else {
+            fileCount = collectSourceFiles(owner, repo, rootContents, codeBuilder, fileCount, userToken);
+        }
+
+        log.info("✓ Collected {} files", fileCount);
+        return codeBuilder.toString();
+    }
+
+    /**
+     * Overload getContents() to accept token
+     */
+    public List<GitHubContent> getContents(String owner, String repo, String path, String userToken) {
+        log.debug("📂 Fetching contents: {}/{}", owner, repo);
+
+        try {
+            WebClient.RequestHeadersSpec<?> request = githubWebClient
+                    .get()
+                    .uri("/repos/{owner}/{repo}/contents/{path}", owner, repo, path);
+
+            if (userToken != null && !userToken.isEmpty()) {
+                request = request.header("Authorization", "Bearer " + userToken);
+            } else if (isTokenValid()) {
+                request = request.header("Authorization", "Bearer " + githubToken);
+            }
+
+            List<GitHubContent> contents = request
+                    .retrieve()
+                    .bodyToMono(new ParameterizedTypeReference<List<GitHubContent>>() {})
+                    .timeout(Duration.ofSeconds(15))
+                    .retryWhen(Retry.backoff(2, Duration.ofSeconds(2)))
+                    .onErrorResume(e -> Mono.just(List.of()))
+                    .block();
+
+            return contents != null ? contents : List.of();
+
+        } catch (Exception e) {
+            log.warn("⚠️ Failed to fetch contents");
+            return List.of();
+        }
+    }
+
+
+    public String generateAuthorizationUrl(String repositoryUrl, String state) {
+        String authUrl = UriComponentsBuilder
+                .fromUriString("https://github.com/login/oauth/authorize")
+                .queryParam("client_id", clientId)
+                .queryParam("redirect_uri", redirectUri)
+                .queryParam("scope", "repo,read:user,user:email,read:org")
+                .queryParam("state", state)  // Include repo URL in state
+                .build()
+                .toUriString();
+        log.info("🔐 Generated GitHub auth URL for repo: {}", repositoryUrl);
+        return authUrl;
+
+    }
+
+    /**
+     * Encode repository URL to pass as state parameter
+     * This way, after auth, we know which repo user was trying to analyze
+     */
+    public String encodeRepoUrl(String repoUrl) {
+        return Base64.getUrlEncoder()
+                .withoutPadding()
+                .encodeToString(repoUrl.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Decode repository URL from state parameter
+     */
+    public String decodeRepoUrl(String encodedUrl) {
+        return new String(
+                Base64.getUrlDecoder().decode(encodedUrl),
+                StandardCharsets.UTF_8
+        );
+    }
+
+
 
     /**
      * Fetch repository metadata (stars, forks, language, etc.)
@@ -113,6 +320,7 @@ public class GitHubService {
         }
     }
 
+
     /**
      * Get contents of a path (files and directories)
      * Includes retry logic with exponential backoff
@@ -154,7 +362,7 @@ public class GitHubService {
      * Get file content with base64 decoding
      * Respects rate limiting and file size limits
      */
-    public String getFileContent(String owner, String repo, String path) {
+    public String getFileContent(String owner, String repo, String path, String userToken) {
         log.debug("📄 Fetching file: {}/{}/{}", owner, repo, path);
 
         try {
@@ -167,10 +375,14 @@ public class GitHubService {
                     .get()
                     .uri("/repos/{owner}/{repo}/contents/{path}", owner, repo, path);
 
-            if (isTokenValid()) {
+//            if (isTokenValid()) {
+//                request = request.header("Authorization", "Bearer " + githubToken);
+//            }
+            if (userToken != null && !userToken.isEmpty()) {
+                request = request.header("Authorization", "Bearer " + userToken);
+            } else if (isTokenValid()) {
                 request = request.header("Authorization", "Bearer " + githubToken);
             }
-
             GitHubContent content = request
                     .retrieve()
                     .bodyToMono(GitHubContent.class)
@@ -207,7 +419,7 @@ public class GitHubService {
      * Detect language - checks root and subdirectories
      */
     private String detectLanguageWithSubdirectories(String owner, String repo,
-                                                    List<GitHubContent> rootContents) {
+                                                    List<GitHubContent> rootContents, String userToken) {
         log.info("🔍 Detecting language from repository");
 
         // Check root files first
@@ -249,7 +461,7 @@ public class GitHubService {
             }
 
             try {
-                List<GitHubContent> folderContents = getContents(owner, repo, folder.getName());
+                List<GitHubContent> folderContents = getContents(owner, repo, folder.getName(), userToken);
 
                 for (GitHubContent file : folderContents) {
                     String fileName = file.getName().toLowerCase();
@@ -268,36 +480,10 @@ public class GitHubService {
         return "Unknown";
     }
 
-    public String collectRepositoryCode(String owner, String repo) {
-        log.info("🔍 Collecting code for {}/{}", owner, repo);
 
-        StringBuilder codeBuilder = new StringBuilder();
-        List<GitHubContent> rootContents = getContents(owner, repo, "");
-
-        if (rootContents.isEmpty()) {
-            log.warn("⚠️ No contents found");
-            return "";
-        }
-
-        int fileCount = 0;
-        fileCount = collectPriorityFiles(owner, repo, rootContents, codeBuilder, fileCount);
-
-        String language = detectLanguageWithSubdirectories(owner, repo, rootContents);
-        log.info("📊 Language: {}", language);
-
-        if ("C#".equalsIgnoreCase(language)) {
-            log.info("🔷 C# detected - scanning all project folders");
-            fileCount = scanAllCSharpFolders(owner, repo, rootContents, codeBuilder, fileCount);
-        } else {
-            fileCount = collectSourceFiles(owner, repo, rootContents, codeBuilder, fileCount);
-        }
-
-        log.info("✓ Collected {} files", fileCount);
-        return codeBuilder.toString();
-    }
 
     private int scanAllCSharpFolders(String owner, String repo, List<GitHubContent> rootContents,
-                                     StringBuilder codeBuilder, int count) {
+                                     StringBuilder codeBuilder, int count, String userToken) {
         for (GitHubContent folder : rootContents) {
             if (count >= maxFiles) break;
 
@@ -313,7 +499,7 @@ public class GitHubService {
 
             log.debug("📂 Scanning: {}", folder.getName());
             count = scanCSharpProjectRecursive(owner, repo, folder.getName(),
-                    codeBuilder, count, 0);
+                    codeBuilder, count, 0, userToken);
         }
 
         return count;
@@ -323,14 +509,14 @@ public class GitHubService {
      * Depth limit prevents infinite recursion
      */
     private int scanCSharpProjectRecursive(String owner, String repo, String path,
-                                           StringBuilder codeBuilder, int count, int depth) {
+                                           StringBuilder codeBuilder, int count, int depth, String userToken) {
         // Limit recursion depth
         if (depth > 5 || count >= maxFiles) {
             return count;
         }
 
         try {
-            List<GitHubContent> contents = getContents(owner, repo, path);
+            List<GitHubContent> contents = getContents(owner, repo, path, userToken);
 
             for (GitHubContent item : contents) {
                 if (count >= maxFiles) break;
@@ -348,11 +534,11 @@ public class GitHubService {
                     // Recurse into subdirectory
                     log.debug("  📂 Scanning folder: {}", itemName);
                     count = scanCSharpProjectRecursive(owner, repo, item.getPath(),
-                            codeBuilder, count, depth + 1);
+                            codeBuilder, count, depth + 1, userToken);
                 } else if ("file".equals(item.getType())) {
                     // Collect relevant C# files
                     if (isCSharpSourceFile(itemNameLower)) {
-                        String content = getFileContent(owner, repo, item.getPath());
+                        String content = getFileContent(owner, repo, item.getPath(), userToken);
                         if (!content.isEmpty()) {
                             appendFileToBuilder(codeBuilder, item.getPath(), content);
                             count++;
@@ -403,7 +589,7 @@ public class GitHubService {
      * Collect priority configuration files
      */
     private int collectPriorityFiles(String owner, String repo, List<GitHubContent> rootContents,
-                                     StringBuilder codeBuilder, int currentCount) {
+                                     StringBuilder codeBuilder, int currentCount,  String userToken) {
         String[] priorityFiles = {
                 "README.md",
                 "package.json", "pom.xml", "build.gradle", "build.gradle.kts",
@@ -419,7 +605,7 @@ public class GitHubService {
         for (String fileName : priorityFiles) {
             if (count >= maxFiles) break;
 
-            String content = fetchFileIfExists(owner, repo, rootContents, fileName);
+            String content = fetchFileIfExists(owner, repo, rootContents, fileName, userToken);
             if (!content.isEmpty()) {
                 appendFileToBuilder(codeBuilder, fileName, content);
                 count++;
@@ -435,7 +621,7 @@ public class GitHubService {
      * Handles Java projects with various folder structures
      */
     private int collectSourceFiles(String owner, String repo, List<GitHubContent> contents,
-                                   StringBuilder codeBuilder, int currentCount) {
+                                   StringBuilder codeBuilder, int currentCount, String userToken) {
         int count = currentCount;
 
         List<GitHubContent> dirs = new ArrayList<>();
@@ -461,9 +647,11 @@ public class GitHubService {
             for (GitHubContent dir : dirs) {
                 if (dir.getName().equalsIgnoreCase(dirName)) {
                     log.debug("📂 Scanning priority folder: {}", dirName);
-                    List<GitHubContent> subContents = getContents(owner, repo, dir.getPath());
-                    count = processDirectoryContentsRecursive(owner, repo, subContents, codeBuilder, count, 0);
-                    break;
+                    List<GitHubContent> subContents = getContents(owner, repo, dir.getPath(), userToken);
+                    if (subContents != null && !subContents.isEmpty()) {
+                        count = processDirectoryContentsRecursive(owner, repo, subContents,
+                                codeBuilder, count, 0, userToken);
+                    }
                 }
             }
         }
@@ -488,7 +676,7 @@ public class GitHubService {
 
             log.debug("  📂 Scanning folder: {}", dirName);
             List<GitHubContent> subContents = getContents(owner, repo, dir.getPath());
-            count = processDirectoryContentsRecursive(owner, repo, subContents, codeBuilder, count, 0);
+            count = processDirectoryContentsRecursive(owner, repo, subContents, codeBuilder, count, 0, userToken);
         }
 
         // Priority 3: Process root-level source files
@@ -497,7 +685,7 @@ public class GitHubService {
             if (count >= maxFiles) break;
 
             if (isSourceCodeFile(file.getName())) {
-                String content = getFileContent(owner, repo, file.getPath());
+                String content = getFileContent(owner, repo, file.getPath(), userToken);
                 if (!content.isEmpty()) {
                     appendFileToBuilder(codeBuilder, file.getPath(), content);
                     count++;
@@ -514,7 +702,7 @@ public class GitHubService {
      */
     private int processDirectoryContentsRecursive(String owner, String repo,
                                                   List<GitHubContent> contents,
-                                                  StringBuilder codeBuilder, int currentCount, int depth) {
+                                                  StringBuilder codeBuilder, int currentCount, int depth, String userToken) {
         if (depth > 5 || currentCount >= maxFiles) {  // Limit recursion depth
             return currentCount;
         }
@@ -534,12 +722,12 @@ public class GitHubService {
             if ("dir".equals(item.getType())) {
                 // Recurse into subdirectories
                 log.debug("  📁 Recursing into: {}", item.getName());
-                List<GitHubContent> subContents = getContents(owner, repo, item.getPath());
-                count = processDirectoryContentsRecursive(owner, repo, subContents, codeBuilder, count, depth + 1);
+                List<GitHubContent> subContents = getContents(owner, repo, item.getPath(), userToken);
+                count = processDirectoryContentsRecursive(owner, repo, subContents, codeBuilder, count, depth + 1,userToken);
             } else if ("file".equals(item.getType())) {
                 // Collect source files
                 if (isSourceCodeFile(item.getName())) {
-                    String content = getFileContent(owner, repo, item.getPath());
+                    String content = getFileContent(owner, repo, item.getPath(), userToken);
                     if (!content.isEmpty()) {
                         appendFileToBuilder(codeBuilder, item.getPath(), content);
                         count++;
@@ -585,27 +773,8 @@ public class GitHubService {
         return false;
     }
 
-    /**
-     * Process directory contents recursively
-     */
-    private int processDirectoryContents(String owner, String repo, List<GitHubContent> contents,
-                                         StringBuilder codeBuilder, int currentCount) {
-        int count = currentCount;
 
-        for (GitHubContent item : contents) {
-            if (count >= maxFiles) break;
 
-            if ("file".equals(item.getType()) && isSourceCodeFile(item.getName())) {
-                String content = getFileContent(owner, repo, item.getPath());
-                if (!content.isEmpty()) {
-                    appendFileToBuilder(codeBuilder, item.getPath(), content);
-                    count++;
-                }
-            }
-        }
-
-        return count;
-    }
 
     /**
      * Helper: Append file content to builder with markers
@@ -618,10 +787,10 @@ public class GitHubService {
     /**
      * Helper: Fetch file if it exists in the root contents
      */
-    private String fetchFileIfExists(String owner, String repo, List<GitHubContent> rootContents, String fileName) {
+    private String fetchFileIfExists(String owner, String repo, List<GitHubContent> rootContents, String fileName, String userToken) {
         for (GitHubContent item : rootContents) {
             if (item.getName().equalsIgnoreCase(fileName) && "file".equals(item.getType())) {
-                return getFileContent(owner, repo, item.getPath());
+                return getFileContent(owner, repo, item.getPath(), userToken);
             }
         }
         return "";

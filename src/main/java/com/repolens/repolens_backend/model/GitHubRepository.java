@@ -49,4 +49,12 @@ public class GitHubRepository {
     public static class Owner {
         private String login;
     }
+
+    @JsonProperty("private")
+    private Boolean private_;  // Use private_ (private is Java keyword)
+
+    // Add this method
+    public boolean isPrivate() {
+        return private_ != null && private_;
+    }
 }

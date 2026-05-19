@@ -55,7 +55,7 @@ public class OpenRouterService {
 
         if (!isApiKeyConfigured()) {
             log.warn("OpenRouter API key not configured! Using mock data.");
-            return createMockAnalysis(repoName);
+            return "{\"error\": \"AI_TIMEOUT\", \"message\": \"The AI took too long to respond. Please try again.\"}";
         }
 
         String truncatedCode = truncateCode(repositoryCode, 50000);
@@ -63,27 +63,7 @@ public class OpenRouterService {
         return callOpenRouterAPI(prompt);
     }
 
-    /**
-     * Generate UI with fallback
-     */
-    public String generateUi(String repositoryCode, String techStack) {
-        log.info("Generating UI mockup with OpenRouter");
 
-        if (!isApiKeyConfigured()) {
-            log.warn("OpenRouter API key not configured! Using mock UI.");
-            return createMockUI();
-        }
-
-        String truncatedCode = truncateCode(repositoryCode, 5000);
-        String prompt = buildUiGenerationPrompt(truncatedCode, techStack);
-
-        try {
-            return callOpenRouterAPI(prompt);
-        } catch (Exception e) {
-            log.error("UI generation failed, returning mock UI: {}", e.getMessage());
-            return createMockUI();
-        }
-    }
 
     /**
      * Call OpenRouter API with proper error handling and retry logic
@@ -96,7 +76,7 @@ public class OpenRouterService {
     private String callOpenRouterAPI(String prompt) {
         Map<String, Object> requestBody = buildRequestBody(prompt);
 
-        try {
+
             String url = "https://openrouter.ai/api/v1/chat/completions";
 
             log.debug("Calling OpenRouter API with model: {}", model);
@@ -111,22 +91,20 @@ public class OpenRouterService {
                     .bodyValue(requestBody)
                     .retrieve()
                     .bodyToMono(String.class)
+                    // ✅ INCREASE TIMEOUT: Give the AI enough time to think
                     .timeout(Duration.ofSeconds(timeoutSeconds))
-                    .retryWhen(Retry.backoff(maxRetries, Duration.ofSeconds(2))
-                            .maxBackoff(Duration.ofSeconds(30))
-                            .doBeforeRetry(signal -> log.warn("Retrying API call, attempt: {}", signal.totalRetries() + 1))
+                    // ✅ SIMPLIFY RETRY: Only retry on actual network/server issues
+                    .retryWhen(Retry.backoff(maxRetries, Duration.ofSeconds(5))
+                            .filter(throwable -> throwable instanceof WebClientResponseException.ServiceUnavailable
+                                    || throwable instanceof java.util.concurrent.TimeoutException)
+                            .doBeforeRetry(signal -> log.warn("Retrying OpenRouter... Attempt: {}", signal.totalRetries() + 1))
                     )
                     .block();
 
             log.info("✅ Received response from OpenRouter API");
             return extractTextFromResponse(response);
 
-        } catch (WebClientResponseException e) {
-            return handleApiError(e);
-        } catch (Exception e) {
-            log.error("Unexpected error calling OpenRouter API: {}", e.getMessage(), e);
-            return createMockAnalysis("repository");
-        }
+
     }
 
     /**
@@ -239,23 +217,6 @@ public class OpenRouterService {
         return prompt;
     }
 
-    /**
-     * Build UI generation prompt
-     */
-    private String buildUiGenerationPrompt(String code, String techStack) {
-        return "Generate a professional HTML UI mockup for this application.\n\n" +
-                "Tech Stack: " + techStack + "\n\n" +
-                "Code Sample:\n" +
-                code + "\n\n" +
-                "Requirements:\n" +
-                "1. Complete, valid HTML with embedded CSS (no external sheets)\n" +
-                "2. Use Tailwind CSS from CDN\n" +
-                "3. Modern, professional design with realistic data\n" +
-                "4. Responsive and mobile-friendly\n" +
-                "5. Include sample screens based on the code structure\n\n" +
-                "Return ONLY the HTML code. No markdown, no explanations.\n" +
-                "Start with <!DOCTYPE html> and end with </html>";
-    }
 
     /**
      * Build OpenRouter API request body
@@ -271,11 +232,9 @@ public class OpenRouterService {
                         Map.of("role", "user", "content", prompt)
                 ),
                 "temperature", 0.5,
-                "max_tokens", 50000,
-                "top_p", 0.9
+                "max_tokens", 6000
         );
     }
-
     /**
      * Extract text from OpenRouter response
      */
@@ -283,6 +242,7 @@ public class OpenRouterService {
         try {
             JsonNode root = objectMapper.readTree(response);
             JsonNode choices = root.path("choices");
+            log.info("🤖 Model used: {}", root.path("model").asText("unknown"));
 
             if (choices.isArray() && choices.size() > 0) {
                 String content = choices.get(0)
@@ -293,6 +253,14 @@ public class OpenRouterService {
                 if (content.isEmpty()) {
                     log.error("Empty content in OpenRouter response");
                     throw new RuntimeException("Empty response from API");
+                }
+
+                // Clean markdown code fences if model wraps JSON
+                content = content.trim();
+                if (content.startsWith("```")) {
+                    content = content.replaceAll("^```[a-zA-Z]*\\n?", "")
+                            .replaceAll("```$", "")
+                            .trim();
                 }
 
                 log.debug("Extracted {} characters from OpenRouter response", content.length());
@@ -307,37 +275,6 @@ public class OpenRouterService {
         }
     }
 
-    /**
-     * Handle API errors with specific strategies
-     */
-    private String handleApiError(WebClientResponseException e) {
-        int status = e.getStatusCode().value();
-
-        switch (status) {
-            case 429:
-                log.warn("⚠️ Rate limit exceeded (429). Using mock data.");
-                return createMockAnalysis("repository");
-
-            case 401:
-            case 403:
-                log.error("❌ Authentication failed ({}). Check API key.", status);
-                throw new RuntimeException("Invalid OpenRouter API key");
-
-            case 503:
-            case 502:
-                log.warn("⚠️ OpenRouter service unavailable ({}). Retrying...", status);
-                throw e;
-
-
-            case 500:
-                log.error("❌ Server error (500): {}", e.getResponseBodyAsString());
-                return createMockAnalysis("repository");
-
-            default:
-                log.error("API error {}: {}", status, e.getResponseBodyAsString());
-                return createMockAnalysis("repository");
-        }
-    }
 
     /**
      * Truncate code to avoid token limits
@@ -357,138 +294,8 @@ public class OpenRouterService {
         return apiKey != null && !apiKey.isEmpty() && !apiKey.equals("your-key-here");
     }
 
-    /**
-     * Create mock analysis for testing/fallback
-     */
-    private String createMockAnalysis(String repoName) {
-        return """
-        {
-          "projectStatus": "In Progress",
-          "completionPercentage": 75,
-          "summary": "Well-structured application with modern development practices. The codebase demonstrates good separation of concerns and follows industry standards.",
-          "strengths": [
-            "Clean layered architecture with Controller-Service-Repository pattern",
-            "Comprehensive error handling with custom exceptions",
-            "Proper use of dependency injection and Spring conventions",
-            "RESTful API design following HTTP best practices"
-          ],
-          "improvements": [
-            {
-              "id": "imp_001",
-              "description": "Add unit tests for service layer with JUnit 5 and Mockito",
-              "effortLevel": "Medium",
-              "estimatedHours": 8.0,
-              "estimatedDays": 1,
-              "category": "Testing",
-              "impact": "Increases code reliability",
-              "priority": "High",
-              "tags": ["testing", "quality"]
-            },
-            {
-              "id": "imp_002",
-              "description": "Implement integration tests for API endpoints using TestRestTemplate",
-              "effortLevel": "Medium",
-              "estimatedHours": 6.0,
-              "estimatedDays": 1,
-              "category": "Testing",
-              "impact": "Catches regressions early",
-              "priority": "High",
-              "tags": ["testing", "integration"]
-            }
-          ],
-          "suggestedUpdates": [
-            {
-              "id": "upd_001",
-              "packageName": "spring-boot",
-              "currentVersion": "3.0.0",
-              "recommendedVersion": "3.2.0",
-              "latestVersion": "3.2.0",
-              "releaseDate": "2024-01-15",
-              "changelog": "https://spring.io/blog",
-              "priority": "High",
-              "breakingChanges": false,
-              "estimatedHours": 1.5,
-              "reason": "Security patches and performance improvements",
-              "impact": "Security",
-              "riskLevel": "Low",
-              "tested": true
-            }
-          ],
-          "techStack": {
-            "languages": ["Java"],
-            "frameworks": ["Spring Boot 3.0"],
-            "libraries": ["Spring Data JPA", "Spring Security", "Lombok"],
-            "buildTool": "Maven"
-          },
-          "codeQuality": {
-            "rating": "Good",
-            "issues": [
-              "Some methods exceed recommended line count",
-              "Missing null safety checks in some areas"
-            ],
-            "bestPractices": [
-              "Uses @Service and @Repository annotations effectively",
-              "Proper exception hierarchy and handling",
-              "Clean method naming conventions"
-            ],
-            "estimatedTestCoverage": 35
-          },
-          "riskAssessment": {
-            "overallRiskLevel": "Medium",
-            "risks": [
-              {
-                "issue": "Missing authentication on some API endpoints",
-                "severity": "High",
-                "mitigation": "Apply @PreAuthorize annotations and test security rules"
-              }
-            ]
-          }
-        }
-        """;
-    }
 
-    /**
-     * Create mock UI for testing/fallback
-     */
-    private String createMockUI() {
-        return """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>RepoLens - Code Review Preview</title>
-            <script src="https://cdn.tailwindcss.com"></script>
-        </head>
-        <body class="bg-gray-50">
-            <nav class="bg-white shadow">
-                <div class="max-w-7xl mx-auto px-4 py-4">
-                    <h1 class="text-2xl font-bold text-blue-600">RepoLens</h1>
-                </div>
-            </nav>
-            
-            <div class="max-w-6xl mx-auto p-6">
-                <div class="bg-white rounded-lg shadow-lg p-8">
-                    <h2 class="text-3xl font-bold mb-4 text-gray-900">Code Review Analysis</h2>
-                    <p class="text-gray-600 mb-8">
-                        This is a preview of the AI-generated analysis. Configure your OpenRouter API key
-                        to generate detailed reviews of your repositories.
-                    </p>
-                    
-                    <div class="grid grid-cols-2 gap-6 mb-8">
-                        <div class="bg-blue-50 border-l-4 border-blue-500 p-4">
-                            <h3 class="font-semibold text-blue-900 mb-2">Quick Stats</h3>
-                            <p class="text-sm text-blue-700">Comprehensive code analysis powered by AI</p>
-                        </div>
-                        <div class="bg-green-50 border-l-4 border-green-500 p-4">
-                            <h3 class="font-semibold text-green-900 mb-2">Real-time Review</h3>
-                            <p class="text-sm text-green-700">Get actionable recommendations instantly</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </body>
-        </html>
-        """;
-    }
+
+
+
 }

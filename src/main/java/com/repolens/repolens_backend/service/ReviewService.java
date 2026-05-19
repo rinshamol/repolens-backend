@@ -2,64 +2,81 @@ package com.repolens.repolens_backend.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.repolens.repolens_backend.dto.AuthorizationRequiredDto;
 import com.repolens.repolens_backend.dto.ReviewRequestDto;
 import com.repolens.repolens_backend.dto.ReviewResponseDto;
 import com.repolens.repolens_backend.model.GitHubRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.*;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class ReviewService {
-
+    @Value("${app.frontend-base-url}")
+    private String frontendBaseUrl;
     private final GitHubService gitHubService;
     private final OpenRouterService openRouterService;
     private final ObjectMapper objectMapper;
 
-    /**
-     * Main orchestration method - coordinates the entire review process
-     */
-    public ReviewResponseDto reviewRepository(ReviewRequestDto request) {
+    public Object reviewRepository(ReviewRequestDto request, String userGitHubToken) {
         long startTime = System.currentTimeMillis();
 
         try {
             log.info("🔍 Starting repository review: {}", request.getRepoUrl());
 
-            // Step 1: Parse and validate GitHub URL
+            // Step 1: Parse URL
             String[] ownerRepo = gitHubService.parseGitHubUrl(request.getRepoUrl());
             String owner = ownerRepo[0];
             String repo = ownerRepo[1];
-            log.debug("✓ Parsed repository: {}/{}", owner, repo);
 
-            // Step 2: Fetch repository metadata from GitHub
-            GitHubRepository repoData = gitHubService.getRepository(owner, repo);
-            log.info("✓ Repository found: {} stars, {} forks", repoData.getStars(), repoData.getForks());
+            // ✅ STEP 2: CHECK ACCESSIBILITY FIRST (before metadata!)
+            String accessibility = gitHubService.checkRepositoryAccessibility(owner, repo, userGitHubToken);
+            log.info("📊 Repository accessibility: {}", accessibility);
 
-            // Step 3: Collect repository code
-            String repositoryCode = gitHubService.collectRepositoryCode(owner, repo);
+            if ("INACCESSIBLE".equals(accessibility)) {
+                log.info("❌ Repository is inaccessible");
+                return buildErrorResponse(
+                        "Repository not found or inaccessible. If this is a private repository, please authorize with GitHub.",
+                        "REPOSITORY_INACCESSIBLE",
+                        startTime
+                );
+            }
+
+            if ("PRIVATE".equals(accessibility)) {
+                if (userGitHubToken == null || userGitHubToken.isEmpty()) {
+                    log.info("🔒 Private repository - user not authenticated");
+                    return buildAuthorizationResponse(request.getRepoUrl());
+                }
+                log.info("🔐 Private repository - user authenticated");
+            }
+
+            // ✅ STEP 3: Now fetch metadata (we know we can access it)
+            GitHubRepository repoData = gitHubService.getRepository(owner, repo, userGitHubToken);
+            log.info("✓ Repository found: {}", repoData.getFullName());
+
+            // ✅ STEP 4: Collect code WITH TOKEN
+            String repositoryCode = gitHubService.collectRepositoryCode(owner, repo, userGitHubToken);
 
             if (repositoryCode.isEmpty()) {
-                log.warn("⚠️ No code files found in repository {}", repoData.getFullName());
+                log.warn("⚠️ No code found in repository");
                 return buildEmptyCodeResponse(repoData, startTime);
             }
 
-            log.info("✓ Collected {} characters of code", repositoryCode.length());
-
-            // Step 4: Analyze with OpenRouter AI
+            // Step 5: Analyze with AI
             String analysisJson = openRouterService.analyzeRepository(
                     repositoryCode,
                     repoData.getName(),
                     repoData.getDescription()
             );
 
-            // Step 5: Parse AI analysis into structured response
+            // Step 6: Parse analysis
             ReviewResponseDto.CodeAnalysis analysis = parseAnalysis(analysisJson);
-
-            // Step 6: Build complete response
             ReviewResponseDto.RepositoryMetadata metadata = buildMetadata(repoData);
 
             long processingTime = System.currentTimeMillis() - startTime;
@@ -75,26 +92,29 @@ public class ReviewService {
 
         } catch (IllegalArgumentException e) {
             log.error("❌ Invalid input: {}", e.getMessage());
-            return buildErrorResponse(
-                    "Invalid GitHub URL: " + e.getMessage(),
-                    "INVALID_INPUT",
-                    startTime
-            );
-        } catch (RuntimeException e) {
-            log.error("❌ Repository error: {}", e.getMessage());
-            return buildErrorResponse(
-                    "Repository not found or inaccessible: " + e.getMessage(),
-                    "REPOSITORY_NOT_FOUND",
-                    startTime
-            );
+            return buildErrorResponse("Invalid GitHub URL", "INVALID_INPUT", startTime);
         } catch (Exception e) {
-            log.error("❌ Unexpected error: {}", e.getMessage(), e);
-            return buildErrorResponse(
-                    "Failed to review repository: " + e.getMessage(),
-                    "INTERNAL_ERROR",
-                    startTime
-            );
+            log.error("❌ Error: {}", e.getMessage());
+            return buildErrorResponse("Failed to review repository", "INTERNAL_ERROR", startTime);
         }
+    }
+
+    /**
+     * Build authorization response - user will auto-redirect
+     */
+    private AuthorizationRequiredDto buildAuthorizationResponse(String repositoryUrl) {
+        String state = gitHubService.encodeRepoUrl(repositoryUrl);
+        String authUrl = gitHubService.generateAuthorizationUrl(repositoryUrl, state);
+
+        return AuthorizationRequiredDto.builder()
+                .type("AUTHORIZATION_REQUIRED")
+                .message("This is a private repository. Redirecting to GitHub authorization...")
+                .repositoryUrl(repositoryUrl)
+                .authorizationUrl(authUrl)
+                .redirectAfterAuth(frontendBaseUrl+"/analyze?repo=" + state)
+                .autoRedirectDelayMs(2000)
+                .autoRedirect(true)
+                .build();
     }
 
     /**
@@ -143,7 +163,6 @@ public class ReviewService {
                         .effortLevel(getStringValue(item, "effortLevel", "Medium"))
                         .estimatedHours(getDoubleValue(item, "estimatedHours", 4.0))
                         .estimatedDays(getIntValue(item, "estimatedDays", 1))
-                        .estimatedTime(getStringValue(item, "estimatedTime", "N/A"))
                         .category(getStringValue(item, "category", "General"))
                         .impact(getStringValue(item, "impact", ""))
                         .priority(getStringValue(item, "priority", "Medium"))
@@ -489,18 +508,70 @@ public class ReviewService {
      * Extract JSON from potential Markdown formatting
      */
     private String extractJson(String text) {
-        // Remove Markdown code fences
-        text = text.replaceAll("```json\\s*", "").replaceAll("```\\s*$", "");
+        if (text == null || text.isEmpty()) return "{}";
 
-        // Find JSON object boundaries
+        // Remove markdown code fences
+        text = text.replaceAll("(?s)```json\\s*", "").replaceAll("```\\s*", "").trim();
+
         int jsonStart = text.indexOf("{");
-        int jsonEnd = text.lastIndexOf("}");
+        if (jsonStart < 0) return "{}";
 
-        if (jsonStart >= 0 && jsonEnd > jsonStart) {
-            return text.substring(jsonStart, jsonEnd + 1);
+        text = text.substring(jsonStart);
+
+        // Check if JSON is complete
+        int jsonEnd = text.lastIndexOf("}");
+        if (jsonEnd > 0) {
+            String candidate = text.substring(0, jsonEnd + 1);
+            try {
+                objectMapper.readTree(candidate); // valid → use it
+                return candidate;
+            } catch (Exception ignored) {
+                // truncated — fall through to repair
+            }
         }
 
-        return text;
+        // Repair truncated JSON by closing all open brackets
+        log.warn("⚠️ Truncated JSON detected, attempting repair...");
+        return repairTruncatedJson(text);
+    }
+    private String repairTruncatedJson(String truncated) {
+        StringBuilder sb = new StringBuilder(truncated);
+        Deque<Character> stack = new ArrayDeque<>();
+
+        boolean inString = false;
+        boolean escape = false;
+
+        for (int i = 0; i < sb.length(); i++) {
+            char c = sb.charAt(i);
+
+            if (escape) { escape = false; continue; }
+            if (c == '\\' && inString) { escape = true; continue; }
+            if (c == '"') { inString = !inString; continue; }
+            if (inString) continue;
+
+            if (c == '{') stack.push('}');
+            else if (c == '[') stack.push(']');
+            else if (c == '}' || c == ']') {
+                if (!stack.isEmpty()) stack.pop();
+            }
+        }
+
+        // If we're mid-string, close it
+        if (inString) sb.append('"');
+
+        // Close all open brackets in reverse order
+        while (!stack.isEmpty()) {
+            sb.append(stack.pop());
+        }
+
+        try {
+            objectMapper.readTree(sb.toString());
+            log.info("✅ JSON repair successful");
+            return sb.toString();
+        } catch (Exception e) {
+            log.error("❌ JSON repair failed: {}", e.getMessage());
+            return "{}";
+        }
     }
 
     /**

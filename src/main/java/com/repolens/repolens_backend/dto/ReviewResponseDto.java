@@ -73,7 +73,6 @@ public class ReviewResponseDto {
         private String effortLevel;        // Easy, Medium, Hard
         private Double estimatedHours;     // e.g., 3.5
         private Integer estimatedDays;     // e.g., 1
-        private String estimatedTime;      // "2-3 hours", "1-2 days" - for backward compatibility
         private String category;           // Security, Testing, Performance, etc.
         private String impact;             // Business impact
         private String priority;           // Critical, High, Medium, Low
