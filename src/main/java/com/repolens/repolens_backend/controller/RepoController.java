@@ -21,7 +21,6 @@ import java.util.Map;
 @RestController
 @RequestMapping("/api")
 @RequiredArgsConstructor
-@CrossOrigin(origins = {"http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:3000", "http://localhost:5173"})
 @Tag(name = "Repository Analysis", description = "Analyze GitHub repositories")
 public class RepoController {
 

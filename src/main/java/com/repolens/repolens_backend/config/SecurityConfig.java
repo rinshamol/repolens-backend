@@ -26,14 +26,14 @@ public class SecurityConfig {
                         .requestMatchers("/api/auth/token", "/swagger-ui/**", "/v3/api-docs/**").permitAll()
                         .requestMatchers("/api/**").permitAll()
                         .anyRequest().authenticated()
-                )
-                .headers(headers -> headers
-                .contentSecurityPolicy(csp -> csp
-                        .policyDirectives("script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
-                                "script-src-elem 'self' 'unsafe-inline' localhost:8080; " +
-                                "connect-src 'self' localhost:8080;")
-                )
-        );
+                );
+//                .headers(headers -> headers
+//                .contentSecurityPolicy(csp -> csp
+//                        .policyDirectives("script-src 'self' 'unsafe-inline' 'unsafe-eval'; " +
+//                                "script-src-elem 'self' 'unsafe-inline' localhost:8080; " +
+//                                "connect-src 'self' localhost:8080;")
+//                )
+//        )
 
 
 
@@ -43,8 +43,9 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration config = new CorsConfiguration();
-        config.setAllowedOrigins(java.util.Arrays.asList("*"));  // ✅ Allow all origins
-        config.setAllowedMethods(java.util.Arrays.asList("*"));  // ✅ Allow all methods
+        config.setAllowedOriginPatterns(java.util.Arrays.asList("*"));
+        config.setAllowCredentials(true);
+        config.setAllowedMethods(java.util.Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(java.util.Arrays.asList("*"));  // ✅ Allow all headers
         config.setMaxAge(3600L);
 
