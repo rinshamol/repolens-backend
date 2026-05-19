@@ -2,6 +2,7 @@ package com.repolens.repolens_backend.controller;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -18,7 +19,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/auth")
-@RequiredArgsConstructor
 @Slf4j
 public class AuthProxyController {
 
@@ -30,7 +30,9 @@ public class AuthProxyController {
 
     // We use a dedicated WebClient for this to avoid conflicts with your GitHub API client base URL
     private final WebClient authWebClient;
-
+    public AuthProxyController(@Qualifier("authWebClient") WebClient authWebClient) {
+        this.authWebClient = authWebClient;
+    }
     @PostMapping(value = "/token", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
     public Mono<ResponseEntity<Map>> proxyGithubToken(
             @RequestParam String code,
