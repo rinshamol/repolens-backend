@@ -3,6 +3,7 @@ package com.repolens.repolens_backend.service;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.retry.annotation.Backoff;
@@ -36,11 +37,11 @@ public class OpenRouterService {
     @Value("${openrouter.api.max-retries:3}")
     private int maxRetries;
 
-    public OpenRouterService(ObjectMapper objectMapper, WebClient openRouterWebClient) {
+    public OpenRouterService(ObjectMapper objectMapper,
+                             @Qualifier("openRouterWebClient") WebClient openRouterWebClient) {
         this.objectMapper = objectMapper;
         this.openRouterWebClient = openRouterWebClient;
     }
-
     /**
      * Analyze repository with retry logic and caching
      */
