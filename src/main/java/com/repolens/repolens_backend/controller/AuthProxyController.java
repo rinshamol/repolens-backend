@@ -24,7 +24,8 @@ import java.util.Map;
 @RequestMapping("/api/auth")
 @Slf4j
 public class AuthProxyController {
-
+    @Value("${app.frontend-base-url}")
+    private String frontendUrl;
     @Value("${spring.security.oauth2.client.registration.github.client-id}")
     private String clientId;
 
@@ -32,14 +33,13 @@ public class AuthProxyController {
     private String clientSecret;
 
     @PostMapping(value = "/token", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
-    public ResponseEntity<Map<String, Object>> proxyGithubToken(
+    public ResponseEntity<Void> proxyGithubToken(
             @RequestParam String code,
             @RequestParam(required = false) String state,
             @RequestParam String redirect_uri) {
 
         log.info("🔄 Proxying token request for GitHub...");
 
-        // Add timeout to prevent hanging
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(10000);
         factory.setReadTimeout(15000);
@@ -66,7 +66,12 @@ public class AuthProxyController {
                 request,
                 new ParameterizedTypeReference<Map<String, Object>>() {}
         );
-        log.info("✅ Token exchanged: {}", response.getStatusCode());
-        return response;
+
+        String accessToken = (String) response.getBody().get("access_token");
+        log.info("✅ Token exchanged, redirecting to frontend");
+
+        return ResponseEntity.status(302)
+                .header("Location", frontendUrl + "?token=" + accessToken)
+                .build();
     }
 }
