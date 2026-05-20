@@ -34,36 +34,35 @@ public class AuthProxyController {
         this.authWebClient = authWebClient;
     }
     @PostMapping(value = "/token", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
-    public Mono<ResponseEntity<Map>> proxyGithubToken(
+    public ResponseEntity<Map> proxyGithubToken(
             @RequestParam String code,
             @RequestParam(required = false) String state,
             @RequestParam String redirect_uri) {
 
         log.info("🔄 Proxying token request for GitHub...");
 
-        return authWebClient.post()
-                .uri("https://github.com/login/oauth/access_token")
-                .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
-                .body(BodyInserters.fromFormData("client_id", clientId)
-                        .with("client_secret", clientSecret)
-                        .with("code", code)
-                        .with("state", state != null ? state : "")
-                        .with("redirect_uri", redirect_uri)
-                        .with("grant_type", "authorization_code"))
-                .retrieve()
-                .toEntity(Map.class)
-                .doOnSuccess(res -> {
-                    log.info("✅ Token exchanged successfully");
-                    log.debug("Response status: {}", res.getStatusCode());
-                })
-                .doOnError(err -> {
-                    log.error("❌ Token exchange failed: {}", err.getMessage());
-                })
-                .onErrorResume(err -> Mono.just(
-                        ResponseEntity.status(500).body(
-                                Map.of("error", "token_exchange_failed",
-                                        "message", err.getMessage())
-                        )
-                ));
+        try {
+            ResponseEntity<Map> response = authWebClient.post()
+                    .uri("https://github.com/login/oauth/access_token")
+                    .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
+                    .body(BodyInserters.fromFormData("client_id", clientId)
+                            .with("client_secret", clientSecret)
+                            .with("code", code)
+                            .with("state", state != null ? state : "")
+                            .with("redirect_uri", redirect_uri)
+                            .with("grant_type", "authorization_code"))
+                    .retrieve()
+                    .toEntity(Map.class)
+                    .block(); // ← blocking call, compatible with webmvc
+
+            log.info("✅ Token exchanged successfully");
+            return response;
+
+        } catch (Exception err) {
+            log.error("❌ Token exchange failed: {}", err.getMessage());
+            return ResponseEntity.status(500).body(
+                    Map.of("error", "token_exchange_failed", "message", err.getMessage())
+            );
+        }
     }
 }
