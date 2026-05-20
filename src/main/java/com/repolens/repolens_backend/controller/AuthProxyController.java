@@ -1,8 +1,7 @@
 package com.repolens.repolens_backend.controller;
 
 import lombok.extern.slf4j.Slf4j;
-import org.jspecify.annotations.Nullable;
-import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
@@ -32,11 +31,6 @@ public class AuthProxyController {
     @Value("${spring.security.oauth2.client.registration.github.client-secret}")
     private String clientSecret;
 
-    // We use a dedicated WebClient for this to avoid conflicts with your GitHub API client base URL
-    private final WebClient authWebClient;
-    public AuthProxyController(@Qualifier("authWebClient") WebClient authWebClient) {
-        this.authWebClient = authWebClient;
-    }
     @PostMapping(value = "/token", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
     public ResponseEntity<Map<String, Object>> proxyGithubToken(
             @RequestParam String code,
@@ -45,7 +39,11 @@ public class AuthProxyController {
 
         log.info("🔄 Proxying token request for GitHub...");
 
-        RestTemplate restTemplate = new RestTemplate();
+        // Add timeout to prevent hanging
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(10000);
+        factory.setReadTimeout(15000);
+        RestTemplate restTemplate = new RestTemplate(factory);
 
         MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
         params.add("client_id", clientId);
@@ -61,11 +59,14 @@ public class AuthProxyController {
 
         HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(params, headers);
 
-        return restTemplate.exchange(
+        log.info(">>> POST https://github.com/login/oauth/access_token");
+        ResponseEntity<Map<String, Object>> response = restTemplate.exchange(
                 "https://github.com/login/oauth/access_token",
                 HttpMethod.POST,
                 request,
                 new ParameterizedTypeReference<Map<String, Object>>() {}
         );
+        log.info("✅ Token exchanged: {}", response.getStatusCode());
+        return response;
     }
 }
