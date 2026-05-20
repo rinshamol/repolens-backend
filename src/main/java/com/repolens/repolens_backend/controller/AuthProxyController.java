@@ -14,7 +14,11 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
-
+import org.springframework.web.client.RestTemplate;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.http.*;
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -34,35 +38,34 @@ public class AuthProxyController {
         this.authWebClient = authWebClient;
     }
     @PostMapping(value = "/token", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
-    public @Nullable ResponseEntity<Map<String, Object>> proxyGithubToken(
+    public ResponseEntity<Map<String, Object>> proxyGithubToken(
             @RequestParam String code,
             @RequestParam(required = false) String state,
             @RequestParam String redirect_uri) {
 
         log.info("🔄 Proxying token request for GitHub...");
 
-        try {
-            @Nullable ResponseEntity<Map<String, Object>> response = authWebClient.post()
-                    .uri("https://github.com/login/oauth/access_token")
-                    .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
-                    .body(BodyInserters.fromFormData("client_id", clientId)
-                            .with("client_secret", clientSecret)
-                            .with("code", code)
-                            .with("state", state != null ? state : "")
-                            .with("redirect_uri", redirect_uri)
-                            .with("grant_type", "authorization_code"))
-                    .retrieve()
-                    .toEntity(new ParameterizedTypeReference<Map<String, Object>>() {})
-                    .block(); // ← blocking call, compatible with webmvc
+        RestTemplate restTemplate = new RestTemplate();
 
-            log.info("✅ Token exchanged successfully");
-            return response;
+        MultiValueMap<String, String> params = new LinkedMultiValueMap<>();
+        params.add("client_id", clientId);
+        params.add("client_secret", clientSecret);
+        params.add("code", code);
+        params.add("redirect_uri", redirect_uri);
+        params.add("grant_type", "authorization_code");
+        if (state != null) params.add("state", state);
 
-        } catch (Exception err) {
-            log.error("❌ Token exchange failed: {}", err.getMessage());
-            return ResponseEntity.status(500).body(
-                    Map.of("error", "token_exchange_failed", "message", err.getMessage())
-            );
-        }
+        HttpHeaders headers = new HttpHeaders();
+        headers.setAccept(List.of(MediaType.APPLICATION_JSON));
+        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+
+        HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(params, headers);
+
+        return restTemplate.exchange(
+                "https://github.com/login/oauth/access_token",
+                HttpMethod.POST,
+                request,
+                new ParameterizedTypeReference<Map<String, Object>>() {}
+        );
     }
 }
