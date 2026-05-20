@@ -165,14 +165,20 @@ Deployed on **Render** using Docker with automatic CI/CD — every push to `mast
 ---
 
 ## 🔐 GitHub OAuth Flow
-
+ 
+This is the actual OAuth2 flow verified from the network tab:
+ 
 ```
-Frontend → GitHub OAuth authorize
-  → GitHub redirects to backend /login/oauth2/code/github
-    → Backend exchanges code for access token via /api/auth/token
-      → Access token returned to frontend
-        → Frontend uses token for private repo access
+1. authorize      → 302   Frontend redirects user to GitHub login
+2. token?code=... → 302   GitHub redirects to backend with auth code
+                           Backend exchanges code for access token
+                           Backend redirects to frontend with ?token=
+3. ?token=gho_... → 200   Frontend receives and stores the access token
+4. user           → 200   Frontend fetches GitHub user info
 ```
+ 
+The backend acts as a secure OAuth proxy — GitHub redirects directly to the backend with the auth code. The backend exchanges it using the client secret (never exposed to the browser), then redirects to the frontend with the final access token.
+ 
 
 ---
 
