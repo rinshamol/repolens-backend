@@ -1,9 +1,10 @@
 package com.repolens.repolens_backend.controller;
 
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.jspecify.annotations.Nullable;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -13,7 +14,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
-import reactor.core.publisher.Mono;
 
 import java.util.Map;
 
@@ -34,7 +34,7 @@ public class AuthProxyController {
         this.authWebClient = authWebClient;
     }
     @PostMapping(value = "/token", consumes = MediaType.APPLICATION_FORM_URLENCODED_VALUE)
-    public ResponseEntity<Map> proxyGithubToken(
+    public @Nullable ResponseEntity<Map<String, Object>> proxyGithubToken(
             @RequestParam String code,
             @RequestParam(required = false) String state,
             @RequestParam String redirect_uri) {
@@ -42,7 +42,7 @@ public class AuthProxyController {
         log.info("🔄 Proxying token request for GitHub...");
 
         try {
-            ResponseEntity<Map> response = authWebClient.post()
+            @Nullable ResponseEntity<Map<String, Object>> response = authWebClient.post()
                     .uri("https://github.com/login/oauth/access_token")
                     .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
                     .body(BodyInserters.fromFormData("client_id", clientId)
@@ -52,7 +52,7 @@ public class AuthProxyController {
                             .with("redirect_uri", redirect_uri)
                             .with("grant_type", "authorization_code"))
                     .retrieve()
-                    .toEntity(Map.class)
+                    .toEntity(new ParameterizedTypeReference<Map<String, Object>>() {})
                     .block(); // ← blocking call, compatible with webmvc
 
             log.info("✅ Token exchanged successfully");
